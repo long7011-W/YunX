@@ -81,6 +81,9 @@ android {
     buildTypes {
         debug {
             signingConfig = signingConfigs.getByName("debug")
+            // 诊断包与正式版并存，避免测试时清除正式版的账号和下载任务。
+            applicationIdSuffix = ".diag"
+            versionNameSuffix = "-diag"
         }
         // Release 变体：R8 代码混淆 + 资源压缩瘦身（未使用的代码/资源裁剪）。
         // 签名：有发布证书就用正式签名（CI nightly / 本地自行导出变量），否则不签名 ⇒
