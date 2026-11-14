@@ -241,11 +241,10 @@ object DouyinParser : VideoParser {
     private suspend fun fetchViaWebView(link: DetectedVideoLink): WebPayload? {
         val type = pathType(link)
         val url = "https://www.douyin.com/$type/${link.id}"
-        val diagnostic = DiagnosticLog.isEnabled()
         val json = HeadlessWebView.loadAndExtract(
             url = url,
             userAgent = VideoHttp.UA_CHROME,
-            readyCheckJs = if (diagnostic) diagnosticReadyCheckJs() else readyCheckJs(),
+            readyCheckJs = readyCheckJs(),
             extractJs = EXTRACT_JS,
             // 页面要在 WebView 里跑完 acrawler 挑战 → 重载 → 挂载 → 再自己发详情请求才拿到数据，
             // 实测视频页冷启动要 25s 上下，所以留足余量（比默认值大）
@@ -389,22 +388,37 @@ object DouyinParser : VideoParser {
 """
 
     /**
-     * 就绪判断：**两条路任一条成立即可**。
+     * 就绪判断：优先等页面详情；DOM 图集则等唯一作品图数量稳定 1.5 秒后再提取。
      *
-     * ★ 不能按链接里的类型分支（2026-10-22 修）：`/video/<id>`、`?modal_id=<id>` 这类链接抖音会自行
-     *   302 到真正的作品页（图文 / 动图会落到 `/note/<id>`），于是「按链接判类型」必然判错 ——
-     *   视频那条判据（等 XHR 钩子）在图文页上**永远不会成立**，只能干等到 40s 超时后整条解析失败。
-     * ★ DOM 那条判据只认**真正的作品图**：`biz_tag=aweme_images` 或 `tplv-dy-aweme-images`。
-     *   封面是 `biz_tag=pcweb_cover`、「相关推荐」带 `WEBPC_RELATED`，两者都不算 —— 否则视频页会
-     *   刚渲染出封面就「就绪」，拿回一堆封面当作品图（视频直链只在钩子数据里，早退就丢了）。
+     * 实测抖音轮播会先挂载 1～19 张，随后约 1.4 秒内补齐；旧逻辑见首图就返回，会截断图集。
+     * 8 秒上限避免页面持续变动时无限等待。
      */
     private fun readyCheckJs(): String = """
 (function () {
   var raw = window.__yunxAwemeDetail;
   if (typeof raw === 'string' && raw.length > 0) return 'true';
+  var now = Date.now();
+  var unique = [];
   var imgs = document.querySelectorAll('img');
   for (var i = 0; i < imgs.length; i++) {
-    if (isWorkImage(imgs[i].src || '')) return 'true';
+    var src = imgs[i].src || '';
+    if (!isWorkImage(src)) continue;
+    if (unique.indexOf(src) < 0) unique.push(src);
+  }
+  if (unique.length > 0) {
+    if (!window.__yunxDomFirstSeenAt) {
+      window.__yunxDomFirstSeenAt = now;
+      window.__yunxDomLastCount = unique.length;
+      window.__yunxDomStableSince = now;
+      window.__yunxDomTimeline = [];
+    } else if (unique.length !== window.__yunxDomLastCount) {
+      window.__yunxDomLastCount = unique.length;
+      window.__yunxDomStableSince = now;
+    }
+    window.__yunxDomTimeline.push((now - window.__yunxDomFirstSeenAt) + ':' + unique.length);
+    if (now - window.__yunxDomStableSince >= 1500 || now - window.__yunxDomFirstSeenAt >= 8000) {
+      return 'true';
+    }
   }
   return 'false';
   function isWorkImage(s) {
@@ -412,37 +426,6 @@ object DouyinParser : VideoParser {
     if (s.indexOf('WEBPC_RELATED') >= 0) return false;
     return s.indexOf('biz_tag=aweme_images') >= 0 || s.indexOf('tplv-dy-aweme-images') >= 0;
   }
-})()
-"""
-
-    /**
-     * 诊断模式专用：首张作品图出现后继续采样 8 秒，记录 DOM 中唯一作品图数量。
-     *
-     * 正常解析仍在首张图出现时返回；只有开启诊断模式才延迟提取，避免把偶发竞态带进普通用户路径。
-     */
-    private fun diagnosticReadyCheckJs(): String = """
-(function () {
-  var now = Date.now();
-  var unique = [];
-  var imgs = document.querySelectorAll('img');
-  for (var i = 0; i < imgs.length; i++) {
-    var src = imgs[i].src || '';
-    if (src.indexOf('douyinpic.com') < 0) continue;
-    if (src.indexOf('WEBPC_RELATED') >= 0) continue;
-    var isWork = src.indexOf('biz_tag=aweme_images') >= 0 || src.indexOf('tplv-dy-aweme-images') >= 0;
-    if (isWork && unique.indexOf(src) < 0) unique.push(src);
-  }
-  if (unique.length > 0 && !window.__yunxFirstWorkImageAt) {
-    window.__yunxFirstWorkImageAt = now;
-    window.__yunxDomTimeline = [];
-  }
-  if (window.__yunxFirstWorkImageAt) {
-    var elapsed = now - window.__yunxFirstWorkImageAt;
-    window.__yunxDomTimeline.push(elapsed + ':' + unique.length);
-    if (elapsed >= 8000) return 'true';
-  }
-  var raw = window.__yunxAwemeDetail;
-  return (typeof raw === 'string' && raw.length > 0) ? 'true' : 'false';
 })()
 """
 
