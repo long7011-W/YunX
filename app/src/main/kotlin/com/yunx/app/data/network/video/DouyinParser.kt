@@ -241,10 +241,11 @@ object DouyinParser : VideoParser {
     private suspend fun fetchViaWebView(link: DetectedVideoLink): WebPayload? {
         val type = pathType(link)
         val url = "https://www.douyin.com/$type/${link.id}"
+        val diagnostic = DiagnosticLog.isEnabled()
         val json = HeadlessWebView.loadAndExtract(
             url = url,
             userAgent = VideoHttp.UA_CHROME,
-            readyCheckJs = readyCheckJs(),
+            readyCheckJs = if (diagnostic) diagnosticReadyCheckJs() else readyCheckJs(),
             extractJs = EXTRACT_JS,
             // 页面要在 WebView 里跑完 acrawler 挑战 → 重载 → 挂载 → 再自己发详情请求才拿到数据，
             // 实测视频页冷启动要 25s 上下，所以留足余量（比默认值大）
@@ -264,7 +265,8 @@ object DouyinParser : VideoParser {
         DiagnosticLog.warn(
             DiagnosticLog.NETWORK, "douyin_webview_media",
             "src=${obj.optString("src")} images=${images.size} motions=${obj.optString("motionCount")} " +
-                "ssr=${obj.optString("ssr")} imgKeys=${obj.optString("imgKeys")} " +
+                "ssr=${obj.optString("ssr")} timeline=${obj.optString("domTimeline")} " +
+                "imgKeys=${obj.optString("imgKeys")} " +
                 "videoKeys=${obj.optString("videoKeys")}"
         )
         val video = obj.optString("video").takeIf { it.isNotBlank() && it != "null" }.orEmpty()
@@ -410,6 +412,37 @@ object DouyinParser : VideoParser {
     if (s.indexOf('WEBPC_RELATED') >= 0) return false;
     return s.indexOf('biz_tag=aweme_images') >= 0 || s.indexOf('tplv-dy-aweme-images') >= 0;
   }
+})()
+"""
+
+    /**
+     * 诊断模式专用：首张作品图出现后继续采样 8 秒，记录 DOM 中唯一作品图数量。
+     *
+     * 正常解析仍在首张图出现时返回；只有开启诊断模式才延迟提取，避免把偶发竞态带进普通用户路径。
+     */
+    private fun diagnosticReadyCheckJs(): String = """
+(function () {
+  var now = Date.now();
+  var unique = [];
+  var imgs = document.querySelectorAll('img');
+  for (var i = 0; i < imgs.length; i++) {
+    var src = imgs[i].src || '';
+    if (src.indexOf('douyinpic.com') < 0) continue;
+    if (src.indexOf('WEBPC_RELATED') >= 0) continue;
+    var isWork = src.indexOf('biz_tag=aweme_images') >= 0 || src.indexOf('tplv-dy-aweme-images') >= 0;
+    if (isWork && unique.indexOf(src) < 0) unique.push(src);
+  }
+  if (unique.length > 0 && !window.__yunxFirstWorkImageAt) {
+    window.__yunxFirstWorkImageAt = now;
+    window.__yunxDomTimeline = [];
+  }
+  if (window.__yunxFirstWorkImageAt) {
+    var elapsed = now - window.__yunxFirstWorkImageAt;
+    window.__yunxDomTimeline.push(elapsed + ':' + unique.length);
+    if (elapsed >= 8000) return 'true';
+  }
+  var raw = window.__yunxAwemeDetail;
+  return (typeof raw === 'string' && raw.length > 0) ? 'true' : 'false';
 })()
 """
 
@@ -605,6 +638,7 @@ object DouyinParser : VideoParser {
       motionCount: motionCount,
       // 诊断字段：没取到动图时靠它们定位（数据源、SSR 状态、图片项与 video 节点的字段名）
       ssr: ssrNote,
+      domTimeline: (window.__yunxDomTimeline || []).join(','),
       imgKeys: picked ? picked.imgKeys : '',
       videoKeys: picked ? picked.videoKeys : '',
       cover: (v && (firstUrl(v.cover) || firstUrl(v.origin_cover))) || ''
