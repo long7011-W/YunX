@@ -241,6 +241,11 @@ object DouyinParser : VideoParser {
     private suspend fun fetchViaWebView(link: DetectedVideoLink): WebPayload? {
         val type = pathType(link)
         val url = "https://www.douyin.com/$type/${link.id}"
+        val diagnostic = DiagnosticLog.isEnabled()
+        val documentHooks = buildList {
+            add(XHR_DETAIL_HOOK_JS)
+            if (diagnostic) add(FETCH_DETAIL_PROBE_JS)
+        }
         val json = HeadlessWebView.loadAndExtract(
             url = url,
             userAgent = VideoHttp.UA_CHROME,
@@ -250,7 +255,7 @@ object DouyinParser : VideoParser {
             // 实测视频页冷启动要 25s 上下，所以留足余量（比默认值大）
             timeoutMs = 40_000L,
             // 钩子必须在文档开始前挂上，才能拿到页面自己发出的详情响应（视频那条路要用）
-            extraDocumentStartJs = listOf(XHR_DETAIL_HOOK_JS)
+            extraDocumentStartJs = documentHooks
         ) ?: return null
         val obj = runCatching { JSONObject(json) }.getOrNull() ?: return null
         obj.optString("error").takeIf { it.isNotBlank() && it != "null" }?.let { err ->
@@ -268,6 +273,17 @@ object DouyinParser : VideoParser {
                 "imgKeys=${obj.optString("imgKeys")} " +
                 "videoKeys=${obj.optString("videoKeys")}"
         )
+        if (diagnostic) {
+            DiagnosticLog.warn(
+                DiagnosticLog.NETWORK, "douyin_motion_probe",
+                "fetch=${obj.optString("fetchProbe")} videos=${obj.optString("domVideos")} " +
+                    "contexts=${obj.optString("domImageContexts")}"
+            )
+            DiagnosticLog.warn(
+                DiagnosticLog.NETWORK, "douyin_resource_probe",
+                obj.optString("resourceProbe")
+            )
+        }
         val video = obj.optString("video").takeIf { it.isNotBlank() && it != "null" }.orEmpty()
         if (images.isEmpty() && video.isBlank()) {
             DiagnosticLog.warn(DiagnosticLog.NETWORK, "douyin_webview_no_media", "页面没有给出可用的图/视频直链")
@@ -382,6 +398,33 @@ object DouyinParser : VideoParser {
         });
       } catch (e) {}
       return rawSend.apply(this, arguments);
+    };
+  } catch (e) {}
+})()
+"""
+
+    /** 诊断模式专用：页面若改用 fetch 拉详情，clone 响应并复用现有图片/动图提取逻辑。 */
+    private const val FETCH_DETAIL_PROBE_JS = """
+(function () {
+  try {
+    if (window.__yunxFetchProbeInstalled || typeof window.fetch !== 'function') return;
+    window.__yunxFetchProbeInstalled = true;
+    var rawFetch = window.fetch;
+    window.fetch = function (input) {
+      var requestUrl = typeof input === 'string' ? input : ((input && input.url) || '');
+      return rawFetch.apply(this, arguments).then(function (response) {
+        try {
+          var finalUrl = response.url || requestUrl;
+          if (response.ok && /(aweme\/detail|slidesinfo|iteminfo|image_post_info)/.test(finalUrl)) {
+            response.clone().text().then(function (text) {
+              if (!text) return;
+              window.__yunxAwemeDetail = text;
+              window.__yunxFetchProbe = finalUrl.split('?')[0].slice(0, 160);
+            }).catch(function () {});
+          }
+        } catch (e) {}
+        return response;
+      });
     };
   } catch (e) {}
 })()
@@ -550,6 +593,76 @@ object DouyinParser : VideoParser {
       return result;
     }
 
+    function shortUrl(url) {
+      try {
+        var u = new URL(url, location.href);
+        return (u.host + u.pathname).slice(0, 160);
+      } catch (e) {
+        return String(url || '').split('?')[0].slice(0, 160);
+      }
+    }
+
+    function isWorkImage(src) {
+      if (!src || src.indexOf('douyinpic.com') < 0) return false;
+      if (src.indexOf('WEBPC_RELATED') >= 0) return false;
+      return src.indexOf('biz_tag=aweme_images') >= 0 || src.indexOf('tplv-dy-aweme-images') >= 0;
+    }
+
+    // 诊断：动图视频可能在轮播 DOM 中，但当前取数只收集 img。
+    function domVideoSummary() {
+      var out = [];
+      var videos = document.querySelectorAll('video');
+      for (var i = 0; i < videos.length && out.length < 20; i++) {
+        var v = videos[i];
+        var src = v.currentSrc || v.src || '';
+        if (!src) {
+          var source = v.querySelector('source');
+          if (source) src = source.src || '';
+        }
+        var parent = v.parentElement;
+        out.push(
+          (src ? shortUrl(src) : 'no-src') +
+          '|poster=' + (v.poster ? shortUrl(v.poster) : '') +
+          '|pcls=' + String((parent && parent.className) || '').slice(0, 80)
+        );
+      }
+      return out.join(';');
+    }
+
+    // 诊断：记录作品静图向上 4 层祖先中是否包含 video，帮助找到静图/动图映射容器。
+    function domImageContexts() {
+      var out = [];
+      var all = document.querySelectorAll('img');
+      var workIndex = 0;
+      for (var i = 0; i < all.length && out.length < 15; i++) {
+        if (!isWorkImage(all[i].src || '')) continue;
+        workIndex++;
+        var node = all[i];
+        var chain = [];
+        for (var depth = 0; node && depth < 5; depth++) {
+          var videoCount = node.querySelectorAll ? node.querySelectorAll('video').length : 0;
+          if (videoCount > 0) {
+            chain.push(depth + ':' + videoCount + ':' + String(node.className || '').slice(0, 60));
+          }
+          node = node.parentElement;
+        }
+        if (chain.length > 0) out.push(workIndex + '=' + chain.join('/'));
+      }
+      return out.join(';');
+    }
+
+    function resourceSummary() {
+      var out = [];
+      var entries = performance.getEntriesByType ? performance.getEntriesByType('resource') : [];
+      for (var i = 0; i < entries.length && out.length < 25; i++) {
+        var name = entries[i].name || '';
+        if (!/(aweme|slide|image_post|video|play)/i.test(name)) continue;
+        var short = shortUrl(name);
+        if (out.indexOf(short) < 0) out.push(short);
+      }
+      return out.join(';');
+    }
+
     var hooked = hookDetail();
     var ssr = readSsrDetail();
 
@@ -622,6 +735,10 @@ object DouyinParser : VideoParser {
       // 诊断字段：没取到动图时靠它们定位（数据源、SSR 状态、图片项与 video 节点的字段名）
       ssr: ssrNote,
       domTimeline: (window.__yunxDomTimeline || []).join(','),
+      fetchProbe: window.__yunxFetchProbe || '',
+      domVideos: domVideoSummary(),
+      domImageContexts: domImageContexts(),
+      resourceProbe: resourceSummary(),
       imgKeys: picked ? picked.imgKeys : '',
       videoKeys: picked ? picked.videoKeys : '',
       cover: (v && (firstUrl(v.cover) || firstUrl(v.origin_cover))) || ''
