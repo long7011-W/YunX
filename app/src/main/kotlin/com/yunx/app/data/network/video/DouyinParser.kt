@@ -264,7 +264,7 @@ object DouyinParser : VideoParser {
         }
         // 图片与动图资源由脚本**成对**产出（同一个数据源、下标一致）
         val images = obj.optJSONArray("images")?.toStringList().orEmpty()
-        val motions = obj.optJSONArray("motions")?.toStringList().orEmpty()
+        val motions = obj.optJSONArray("motions")?.toRawStringList().orEmpty()
         // 诊断：用了哪个数据源、拿到几张图/几张动图、SSR 状态、首项字段名 —— 排查「为什么没有动图」全靠这一行
         DiagnosticLog.warn(
             DiagnosticLog.NETWORK, "douyin_webview_media",
@@ -303,6 +303,10 @@ object DouyinParser : VideoParser {
     /** `JSONArray` → `List<String>`（丢掉空值；解析脚本给的字段都是字符串） */
     private fun JSONArray.toStringList(): List<String> =
         (0 until length()).mapNotNull { optString(it).takeIf(String::isNotBlank) }
+
+    /** 动图必须保留空串占位，否则后面的 Live Photo 会错配到前面的静图。 */
+    private fun JSONArray.toRawStringList(): List<String> =
+        (0 until length()).map { optString(it).orEmpty() }
 
     /** 把 WebView 取回的事实拼成解析结果（图文优先：详情里 `images` 有值就是图文） */
     private fun buildFromWebView(link: DetectedVideoLink, payload: WebPayload): VideoParseResult {
@@ -580,17 +584,48 @@ object DouyinParser : VideoParser {
     }
 
     // DOM 里的作品图兜底（只认 aweme_images / tplv-dy-aweme-images，排除封面与「相关推荐」）
+    function videoSrcOf(video) {
+      if (!video) return '';
+      var src = video.currentSrc || video.src || '';
+      if (!src) src = video.getAttribute('src') || '';
+      if (!src) {
+        var source = video.querySelector('source');
+        if (source) src = source.src || source.getAttribute('src') || '';
+      }
+      return src;
+    }
+
+    // 动图视频必须从该静图所在的 Swiper slide 内取，外层容器可能混入别的作品/推荐视频。
+    function domMotionUrl(img) {
+      var slide = img.closest ? img.closest('[class*="dySwiperSlide"], [class*="swiper-slide"]') : null;
+      if (!slide) return '';
+      var videos = slide.querySelectorAll('video');
+      var fallback = '';
+      for (var i = 0; i < videos.length; i++) {
+        var src = videoSrcOf(videos[i]);
+        if (!src) continue;
+        if (src.indexOf('douyinvod.com') >= 0 && src.indexOf('/video/tos/') >= 0) return src;
+        if (!fallback && src.indexOf('douyinstatic.com') < 0) fallback = src;
+      }
+      return fallback;
+    }
+
     function domWorkImages() {
-      var result = [];
+      var seen = [];
+      var images = [];
+      var motions = [];
       var all = document.querySelectorAll('img');
       for (var i = 0; i < all.length; i++) {
         var src = all[i].src || '';
         if (src.indexOf('douyinpic') < 0) continue;
         if (src.indexOf('WEBPC_RELATED') >= 0) continue;
         var isWork = src.indexOf('biz_tag=aweme_images') >= 0 || src.indexOf('tplv-dy-aweme-images') >= 0;
-        if (isWork && result.indexOf(src) < 0) result.push(src);
+        if (!isWork || seen.indexOf(src) >= 0) continue;
+        seen.push(src);
+        images.push(src);
+        motions.push(domMotionUrl(all[i]));
       }
-      return result;
+      return images.length ? { images: images, motions: motions } : null;
     }
 
     function shortUrl(url) {
@@ -646,7 +681,8 @@ object DouyinParser : VideoParser {
           }
           node = node.parentElement;
         }
-        if (chain.length > 0) out.push(workIndex + '=' + chain.join('/'));
+        var motion = domMotionUrl(all[i]);
+        out.push(workIndex + '=' + (motion ? shortUrl(motion) : 'none') + '|' + chain.join('/'));
       }
       return out.join(';');
     }
@@ -683,8 +719,14 @@ object DouyinParser : VideoParser {
       images = picked.images;
       motions = picked.motions;
     } else {
-      images = domWorkImages();
-      src = images.length ? 'dom' : 'none';
+      var domPicked = domWorkImages();
+      if (domPicked) {
+        images = domPicked.images;
+        motions = domPicked.motions;
+        src = 'dom';
+      } else {
+        src = 'none';
+      }
     }
 
     // 视频直链：钩子优先（视频页的详情在这里），其次 SSR
